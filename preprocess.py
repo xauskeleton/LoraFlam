@@ -1,131 +1,202 @@
-from datasets import Dataset
-from PIL import Image
-import os
 import json
+import csv
+from pathlib import Path
+import random
+import re
 import torch
-import sys
+import numpy as np
+from PIL import Image
+from collections import defaultdict
+from transformers import CLIPProcessor, CLIPModel, AutoTokenizer
+from transformers import BlipProcessor, BlipForConditionalGeneration
 
-# Import image_processor từ open_clip và tokenizer từ transformers
-try:
-    import open_clip
-    from transformers import AutoTokenizer
-except ImportError as e:
-    print(f"Error importing dependencies: {e}")
-    print("Please install with 'pip install open_clip_torch transformers'.")
-    sys.exit(1)
+# --- config ---
+DESCRIPTIONS = "Descriptions.json"
+CASE_TOPIC = "Case_topic.json"
+IMAGES_OVERVIEW = "images_overview.csv"
+IMAGES_DIR = "images"
+MODEL_NAME = "Salesforce/blip-vqa-base"
+SPLIT_SEED = 42
+TRAIN_RATIO, VAL_RATIO, TEST_RATIO = 0.8, 0.1, 0.1
+MAX_LEN = 512
+# ----------------
 
-# Kiểm tra phiên bản torch (>=2.1 cho open_flamingo tương thích)
-if torch.__version__ < "2.1":
-    print(f"Warning: PyTorch version {torch.__version__} is < 2.1. OpenFlamingo requires >= 2.1. Please upgrade with 'pip install --upgrade torch torchvision'.")
-    sys.exit(1)
+def clean_text(s):
+    if not s: return ""
+    s = str(s).strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-# Load image_processor (từ OpenFlamingo 3B config: ViT-L/14 openai)
-model_clip, _, image_processor = open_clip.create_model_and_transforms('ViT-L/14', pretrained='openai')
+# === load data ===
+with open(DESCRIPTIONS, "r", encoding="utf-8") as f:
+    desc_list = json.load(f)
+img2desc = {d["image"]: d for d in desc_list if "image" in d}
 
-# Load tokenizer (từ OpenFlamingo 3B config: mpt-1b-redpajama-200b)
-tokenizer = AutoTokenizer.from_pretrained("anas-awadalla/mpt-1b-redpajama-200b")
+with open(CASE_TOPIC, "r", encoding="utf-8") as f:
+    cases = json.load(f)
+uid2case = {c["U_id"]: c for c in cases if "U_id" in c}
 
-# Set pad_token to eos_token if not defined (fixes the padding error)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
+img_overview = {}
+if Path(IMAGES_OVERVIEW).exists():
+    with open(IMAGES_OVERVIEW, newline="", encoding="utf-8") as csvfile:
+        reader = csv.DictReader(csvfile)
+        for r in reader:
+            key = r.get("ID_Image")
+            if key:
+                img_overview[key] = r
 
-if __name__ == '__main__':
-    # Đường dẫn thư mục dataset
-    data_dir = "MedPix-2-0"
-    images_dir = os.path.join(data_dir, "images")
+# === models ===
+device = "cuda" if torch.cuda.is_available() else "cpu"
+clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+tokenizer = BlipProcessor.from_pretrained(MODEL_NAME).tokenizer
 
-    # Kiểm tra và load Descriptions.json
-    descriptions_path = os.path.join(data_dir, "Descriptions.json")
-    if not os.path.exists(descriptions_path):
-        raise FileNotFoundError(f"Descriptions.json not found in {data_dir}")
-    with open(descriptions_path, "r", encoding="utf-8") as f:
-        descriptions = json.load(f)
-
-    # Load Case_topic.json
-    case_topic_path = os.path.join(data_dir, "Case_topic.json")
-    if not os.path.exists(case_topic_path):
-        raise FileNotFoundError(f"Case_topic.json not found in {data_dir}")
-    with open(case_topic_path, "r", encoding="utf-8") as f:
-        case_topics = json.load(f)
-
-    # Tạo ánh xạ U_id -> Case Diagnosis
-    case_diagnosis_map = {case["U_id"]: case["Case"]["Case Diagnosis"] for case in case_topics}
-
-    # Tạo danh sách dữ liệu
-    data = []
-    for desc in descriptions:
-        image_name = desc["image"] + ".png"
-        image_path = os.path.join(images_dir, image_name)
-        
-        if os.path.exists(image_path):
-            caption = desc["Description"]["Caption"]
-            prompt = f"<image>\nCaption: {caption}"
-            data.append({
-                "image_path": image_path,
-                "text": prompt,
-                "label": caption
-            })
-        else:
-            print(f"Warning: Image not found: {image_path}")
-
-    # Tạo dataset từ danh sách
-    dataset = Dataset.from_list(data)
-
-    if len(dataset) == 0:
-        raise ValueError("No valid data samples found. Check image files and Descriptions.json.")
-
-    # Chia train/test
-    dataset = dataset.train_test_split(test_size=0.1, seed=42)
-
-    # Hàm preprocess
-    def preprocess_function(examples):
-        try:
-            images = [Image.open(img_path).convert("RGB") for img_path in examples["image_path"]]
-        except Exception as e:
-            raise ValueError(f"Error loading images: {e}")
-        
-        texts = examples["text"]
-        labels = examples["label"]
-        
-        # Process images với image_processor và đảm bảo là tensor
-        pixel_values = torch.stack([torch.from_numpy(image_processor(img).numpy()) for img in images])
-        
-        # Tokenize text (prompt)
-        input_ids = tokenizer(
-            texts,
-            padding="max_length",
-            max_length=128,
-            truncation=True,
-            return_tensors="pt"
-        )["input_ids"]
-        
-        # Tokenize labels (caption)
-        labels_ids = tokenizer(
-            labels,
-            padding="max_length",
-            max_length=128,
-            truncation=True,
-            return_tensors="pt"
-        )["input_ids"]
-        
-        return {
-            "pixel_values": pixel_values,
-            "input_ids": input_ids,
-            "labels": labels_ids
-        }
-
-    # Áp dụng preprocess
-    tokenized_dataset = dataset.map(
-        preprocess_function,
-        batched=True,
-        batch_size=16,
-        remove_columns=dataset["train"].column_names,
-        num_proc=4
+# === tokenize ===
+def tokenize_pair(input_text, output_text):
+    enc_in = tokenizer(
+        input_text, max_length=MAX_LEN, truncation=True,
+        padding="max_length", return_tensors="pt"
+    )
+    enc_out = tokenizer(
+        output_text, max_length=MAX_LEN, truncation=True,
+        padding="max_length", return_tensors="pt"
+    )
+    return (
+        enc_in["input_ids"].squeeze(0),
+        enc_in["attention_mask"].squeeze(0),
+        enc_out["input_ids"].squeeze(0),
     )
 
-    # Lưu dataset
-    output_dir = "./medpix_processed_local"
-    os.makedirs(output_dir, exist_ok=True)
-    tokenized_dataset.save_to_disk(output_dir)
+# === group images by case ===
+uid2images = defaultdict(list)
+for image_id, desc in img2desc.items():
+    uid2images[desc["U_id"]].append(image_id)
 
-    print(f"Dataset prepared with {len(dataset['train'])} train and {len(dataset['test'])} test samples.")
+# === build dataset (n + m) ===
+records = []
+
+for uid, image_ids in uid2images.items():
+    if uid not in uid2case:
+        continue
+    case = uid2case[uid]
+
+    # -------- CASE sample (m) --------
+    all_tensors = []
+    for image_id in image_ids:
+        image_path = img_overview.get(image_id, {}).get("image_path")
+        if not image_path:
+            for ext in [".jpg", ".jpeg", ".png", ".bmp", ".png"]:
+                candidate = Path(IMAGES_DIR) / f"{image_id}{ext}"
+                if candidate.exists():
+                    image_path = str(candidate); break
+        if image_path and Path(image_path).exists():
+            image = Image.open(image_path).convert("RGB")
+            inputs = clip_processor(images=image, return_tensors="pt")
+            img_tensor = inputs["pixel_values"].squeeze(0)  # (3,224,224)
+            all_tensors.append(img_tensor)
+
+    if all_tensors:
+        pixel_values = torch.stack(all_tensors, dim=0)  # (N,3,224,224)
+        diagnosis = clean_text(case.get("Case", {}).get("Case Diagnosis") or "")
+        history = clean_text(case.get("Case", {}).get("History") or "")
+        topic_disc = clean_text(case.get("Topic", {}).get("Disease Discussion") or "")
+        topic_summary = ". ".join(topic_disc.split(".")[:2]) if topic_disc else ""
+
+        input_text = f"History: {history}" if history else ""
+        output_text = f"Diagnosis: {diagnosis}\nDiscussion: {topic_summary}"
+
+        input_ids, attn_mask, labels = tokenize_pair(input_text, output_text)
+
+        records.append({
+            "type": "case",
+            "U_id": uid,
+            "pixel_values": pixel_values,   # (N,3,224,224)
+            "input_ids": input_ids,
+            "text_attention_mask": attn_mask,
+            "labels": labels
+        })
+
+    # -------- SINGLE samples (n) --------
+    for image_id in image_ids:
+        desc = img2desc[image_id]
+        d = desc["Description"]
+        caption = clean_text(d.get("Caption") or "")
+        modality = clean_text(d.get("Modality") or "")
+        location = clean_text(desc.get("Location") or "")
+        age, sex = clean_text(d.get("Age") or ""), clean_text(d.get("Sex") or "")
+        short_info = f"Age: {age}, Sex: {sex}".strip(", ")
+
+        input_text = f"Modality: {modality}\nLocation: {location}\n{short_info}" # Chỉnh caption từ bên input text sang output
+        output_text = f"Caption: {caption}"  
+
+        image_path = None
+        for ext in [".jpg", ".jpeg", ".png", ".bmp"]:
+            candidate = Path(IMAGES_DIR) / f"{image_id}{ext}"
+            if candidate.exists(): image_path = str(candidate); break
+
+        if image_path and Path(image_path).exists():
+            image = Image.open(image_path).convert("RGB")
+            inputs = clip_processor(images=image, return_tensors="pt")
+            img_tensor = inputs["pixel_values"]  # xóa .squeeze(0) để thành tensor 4d
+
+            input_ids, attn_mask, labels = tokenize_pair(input_text, output_text)
+
+            records.append({
+                "type": "single",
+                "U_id": uid,
+                "image_id": image_id,
+                "pixel_values": img_tensor,  # (1,3,224,224)
+                "input_ids": input_ids,
+                "text_attention_mask": attn_mask,
+                "labels": labels
+            })
+
+# === split train/val/test ===
+uids = list(uid2images.keys())
+random.Random(SPLIT_SEED).shuffle(uids)
+n = len(uids); n_train = int(n*TRAIN_RATIO); n_val = int(n*VAL_RATIO)
+train_uids = set(uids[:n_train]); val_uids = set(uids[n_train:n_train+n_val])
+test_uids = set(uids[n_train+n_val:])
+def which_split(uid): return "train" if uid in train_uids else ("val" if uid in val_uids else "test")
+
+for r in records:
+    r["split"] = which_split(r["U_id"])
+
+print(f"✅ Dataset built: {len(records)} samples (single + case)")
+
+# === Demo in thử ===
+print("\n--- Example HF-style sample ---")
+sample = records[0]
+print("Keys:", sample.keys())
+print("U_id:", sample["U_id"])
+print("pixel_values shape:", sample["pixel_values"].shape)
+print("input_ids shape:", sample["input_ids"].shape)
+print("labels shape:", sample["labels"].shape)
+
+# === Dataset Summary ===
+print("\n=== Dataset Summary ===")
+num_single = sum(1 for r in records if r["type"] == "single")
+num_case   = sum(1 for r in records if r["type"] == "case")
+print(f"Total samples: {len(records)}")
+print(f"  Single-image samples: {num_single}")
+print(f"  Case-combined samples: {num_case}")
+
+# In thử vài sample individual
+print("\n--- Example INDIVIDUAL samples ---")
+ind_samples = [r for r in records if r["type"] == "single"][:2]
+for i, s in enumerate(ind_samples, 1):
+    print(f"[IND {i}] U_id: {s['U_id']}, image_id: {s['image_id']}")
+    print(" caption:", s["input_ids"][:20].tolist(), "...")  # in token ID để thấy
+    print(" pixel_values shape:", s["pixel_values"].shape)
+
+# In thử vài sample combined
+print("\n--- Example COMBINED samples ---")
+case_samples = [r for r in records if r["type"] == "case"][:2]
+for i, s in enumerate(case_samples, 1):
+    print(f"[CASE {i}] U_id: {s['U_id']}, số ảnh: {s['pixel_values'].shape[0]}")
+    print(" caption:", s["input_ids"][:20].tolist(), "...")  # in token ID
+    print(" pixel_values shape:", s["pixel_values"].shape)   # (N,3,224,224)
+
+
+
+
+
