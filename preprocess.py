@@ -9,16 +9,17 @@ from PIL import Image
 from collections import defaultdict
 from transformers import CLIPProcessor, CLIPModel, AutoTokenizer
 from transformers import BlipProcessor, BlipForConditionalGeneration
+from datasets import Dataset
 
 # --- config ---
 DESCRIPTIONS = "Descriptions.json"
 CASE_TOPIC = "Case_topic.json"
 IMAGES_OVERVIEW = "images_overview.csv"
 IMAGES_DIR = "images"
-MODEL_NAME = "Salesforce/blip-vqa-base"
+MODEL_NAME = "Salesforce/blip-vqa-base" # thay BERT bang BLIP
 SPLIT_SEED = 42
 TRAIN_RATIO, VAL_RATIO, TEST_RATIO = 0.8, 0.1, 0.1
-MAX_LEN = 512
+MAX_LEN = 256
 # ----------------
 
 def clean_text(s):
@@ -60,6 +61,7 @@ def tokenize_pair(input_text, output_text):
         output_text, max_length=MAX_LEN, truncation=True,
         padding="max_length", return_tensors="pt"
     )
+    enc_out["input_ids"][enc_out["input_ids"] == tokenizer.pad_token_id] = -100
     return (
         enc_in["input_ids"].squeeze(0),
         enc_in["attention_mask"].squeeze(0),
@@ -97,11 +99,13 @@ for uid, image_ids in uid2images.items():
     if all_tensors:
         pixel_values = torch.stack(all_tensors, dim=0)  # (N,3,224,224)
         diagnosis = clean_text(case.get("Case", {}).get("Case Diagnosis") or "")
+        exam = clean_text(case.get("Case", {}).get("Exam") or "")
+        findings = clean_text(case.get("Case", {}).get("Findings") or "")
         history = clean_text(case.get("Case", {}).get("History") or "")
         topic_disc = clean_text(case.get("Topic", {}).get("Disease Discussion") or "")
         topic_summary = ". ".join(topic_disc.split(".")[:2]) if topic_disc else ""
 
-        input_text = f"History: {history}" if history else ""
+        input_text = f"History: {history}\nExam: {exam}\nFindins: {findings}"
         output_text = f"Diagnosis: {diagnosis}\nDiscussion: {topic_summary}"
 
         input_ids, attn_mask, labels = tokenize_pair(input_text, output_text)
@@ -187,6 +191,9 @@ for i, s in enumerate(ind_samples, 1):
     print(f"[IND {i}] U_id: {s['U_id']}, image_id: {s['image_id']}")
     print(" caption:", s["input_ids"][:20].tolist(), "...")  # in token ID để thấy
     print(" pixel_values shape:", s["pixel_values"].shape)
+    print("input_ids:", ["input_ids"])
+    print("text_attention_mask:", ["text_attention_mask"])
+    print("labels:", ["labels"])
 
 # In thử vài sample combined
 print("\n--- Example COMBINED samples ---")
@@ -195,8 +202,22 @@ for i, s in enumerate(case_samples, 1):
     print(f"[CASE {i}] U_id: {s['U_id']}, số ảnh: {s['pixel_values'].shape[0]}")
     print(" caption:", s["input_ids"][:20].tolist(), "...")  # in token ID
     print(" pixel_values shape:", s["pixel_values"].shape)   # (N,3,224,224)
+    print("input_ids:", ["input_ids"])
+    print("text_attention_mask:", ["text_attention_mask"])
+    print("labels:", ["labels"])
 
 
+# Chuyển list records thành HF Dataset
+ds = Dataset.from_list(records)
+
+# Chọn các cột cần dùng và set format PyTorch
+ds.set_format(
+    type="torch",
+    columns=["input_ids", "text_attention_mask", "labels", "pixel_values"]
+)
+
+# Lưu ra disk
+ds.save_to_disk("dataset_hf")
 
 
 
