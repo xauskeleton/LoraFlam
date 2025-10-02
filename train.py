@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 from datasets import load_from_disk
 from transformers import (
     AutoTokenizer,
@@ -10,149 +9,256 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
-
 from peft import LoraConfig, get_peft_model
-from Collator import collator  # collator bạn đã viết sẵn
+from Collator import collator
 import os
+
 os.environ["WANDB_MODE"] = "disabled"
 
-# ---------------------------
-# 1. Dataset + DataLoader
-# ---------------------------
-print("Loading dataset...")
-dataset = load_from_disk("dataset_hf")
-
-# train/val split nếu chưa có
-if "train" not in dataset:
-    dataset = dataset.train_test_split(test_size=0.05)
-
-train_dataset = dataset["train"]
-val_dataset = dataset["test"]
-
-# ---------------------------
-# 2. Load Vision + Language Model
-# ---------------------------
-print("Loading vision encoder and language model...")
-
-vision_encoder = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32")
-image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
-
-lang_model_name = "facebook/opt-350m"
-tokenizer = AutoTokenizer.from_pretrained(lang_model_name)
-tokenizer.pad_token = tokenizer.eos_token  # phòng khi thiếu pad token
-lang_model = AutoModelForCausalLM.from_pretrained(lang_model_name)
-
-# ---------------------------
-# 3. Define Flamingo-style wrapper
-# ---------------------------
-class FlamingoMini(nn.Module):
-    def __init__(self, vision_encoder, lang_model, vision_hidden=512, cross_attn_every_n=4):
+# LLAVA MODEL DEFINITION
+class LLaVAModel(nn.Module):
+    """
+    LLaVA: Visual instruction tuning
+    - CLIP vision encoder
+    - Linear projection
+    - LLM (Vicuna/LLaMA/Mistral)
+    """
+    def __init__(self, vision_encoder, lang_model, image_token_id):
         super().__init__()
         self.vision_encoder = vision_encoder
         self.lang_model = lang_model
+        self.image_token_id = image_token_id
+        
+        self.vision_hidden_size = vision_encoder.config.hidden_size
+        self.lang_hidden_size = lang_model.config.hidden_size
+        
+        # Projection layer: vision -> language dimension
+        self.mm_projector = nn.Linear(
+            self.vision_hidden_size,
+            self.lang_hidden_size
+        )
+        
+        print(f"\n✓ LLaVA Model initialized:")
+        print(f"  Vision: {self.vision_hidden_size}D -> Language: {self.lang_hidden_size}D")
 
-        self.vision_proj = nn.Linear(vision_encoder.config.hidden_size, vision_hidden)
-
-        self.cross_attn_every_n = cross_attn_every_n
-        self.cross_attn_blocks = nn.ModuleList([
-            nn.MultiheadAttention(embed_dim=vision_hidden, num_heads=8, batch_first=True)
-            for _ in range(len(lang_model.model.decoder.layers) // cross_attn_every_n)
-        ])
-
-        # map hidden của LM về vision_hidden nếu khác dim
-        self.text_proj = nn.Linear(lang_model.config.hidden_size, vision_hidden)
-        self.text_unproj = nn.Linear(vision_hidden, lang_model.config.hidden_size)
+    def encode_images(self, images):
+        """Encode images: CLIP -> mean pool -> projection"""
+        with torch.no_grad():
+            image_features = self.vision_encoder(images).last_hidden_state
+        
+        # Mean pool patches: (B, num_patches, hidden) -> (B, hidden)
+        image_features = image_features.mean(dim=1)
+        
+        # Project to language space
+        image_features = self.mm_projector(image_features)
+        
+        return image_features
 
     def forward(self, pixel_values, input_ids, attention_mask, num_images, labels=None):
+        """
+        Forward pass
+        
+        Args:
+            pixel_values: (B*N, 3, 224, 224) - all images flattened
+            input_ids: (B, D) - text with <image> tokens at beginning
+            attention_mask: (B, D)
+            num_images: (B,) - number of images per sample
+            labels: (B, D) - for training
+        """
         B = input_ids.size(0)
-
-        # ---- 1. Vision encoder ----
-        vision_out = self.vision_encoder(pixel_values=pixel_values)
-        vision_embeds = self.vision_proj(vision_out.last_hidden_state)  # (B*T, N, 512)
-
-        # gộp lại cho từng sample
-        N = vision_embeds.size(1)
-        T = num_images.max().item()
-        vision_embeds = vision_embeds.view(B, T*N, -1)  # (B, T*N, 512)
-
-        # ---- 2. Language model hidden ----
+        device = input_ids.device
+        
+        # Convert num_images to tensor if needed
+        if not isinstance(num_images, torch.Tensor):
+            num_images = torch.tensor(num_images, device=device)
+        
+        # 1. Encode all images
+        if pixel_values.size(0) > 0:
+            image_features = self.encode_images(pixel_values)  # (B*N, lang_hidden)
+        else:
+            image_features = None
+        
+        # 2. Get text embeddings
+        text_embeds = self.lang_model.get_input_embeddings()(input_ids)  # (B, D, lang_hidden)
+        
+        # 3. Replace <image> tokens at beginning with image features
+        if image_features is not None:
+            img_idx = 0
+            
+            for b in range(B):
+                n_img = num_images[b].item() if isinstance(num_images[b], torch.Tensor) else num_images[b]
+                
+                if n_img > 0:
+                    # Collator đã đặt image tokens ở đầu sequence
+                    for i in range(n_img):
+                        if img_idx < image_features.size(0):
+                            text_embeds[b, i] = image_features[img_idx]
+                            img_idx += 1
+        
+        # 4. Forward through language model
         outputs = self.lang_model(
-            input_ids=input_ids,
+            inputs_embeds=text_embeds,
             attention_mask=attention_mask,
-            output_hidden_states=True,
+            labels=labels,
             return_dict=True,
         )
-        hidden = outputs.hidden_states[-1]  # (B, L, 1024)
-
-        # ---- 3. Projection sang vision space ----
-        hidden_proj = self.text_proj(hidden)  # (B, L, 512)
-
-        # ---- 4. Cross attention ----
-        for i, block in enumerate(self.cross_attn_blocks):
-            if i * self.cross_attn_every_n < hidden_proj.size(1):
-                attn_out, _ = block(hidden_proj, vision_embeds, vision_embeds)
-                hidden_proj = hidden_proj + attn_out
-
-        # ---- 5. Chiếu ngược về dim của LM ----
-        hidden_final = self.text_unproj(hidden_proj)  # (B, L, 1024)
-
-        # ---- 6. Tính logits ----
-        logits = self.lang_model.lm_head(hidden_final)  # (B, L, V)
-
-        # ---- 7. Loss ----
-        loss = None
-        if labels is not None:
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            loss = loss_fct(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-            )
-
-        return {"loss": loss, "logits": logits}
+        
+        return outputs
 
 
-# ---------------------------
-# 4. Wrap model + add LoRA
-# ---------------------------
-print("Building FlamingoMini with LoRA...")
+# ==========================================
+# MAIN TRAINING SCRIPT
+# ==========================================
 
-model = FlamingoMini(vision_encoder, lang_model)
+def main():
+    print("="*60)
+    print("LLaVA TRAINING SCRIPT")
+    print("="*60)
+    
+    # ---------------------------
+    # 1. Load Dataset
+    # ---------------------------
+    print("\n[1/5] Loading dataset...")
+    dataset = load_from_disk("MedPix-2-0/dataset_hf")
+    
+    if "train" not in dataset:
+        dataset = dataset.train_test_split(test_size=0.05)
+    
+    train_dataset = dataset["train"]
+    val_dataset = dataset["test"]
+    print(f"  Train: {len(train_dataset)} samples")
+    print(f"  Val: {len(val_dataset)} samples")
+    
+    # ---------------------------
+    # 2. Load Models
+    # ---------------------------
+    print("\n[2/5] Loading models...")
+    
+    # Vision encoder - CLIP ViT-Large
+    print("  Loading vision encoder...")
+    vision_encoder = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14")
+    image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
+    
+    # Language model - Chọn 1 trong các options:
+    print("  Loading language model...")
+    
+    # OPTION 1: Vicuna (khuyên dùng nếu có access)
+    # lang_model_name = "lmsys/vicuna-7b-v1.5"
+    
+    # OPTION 2: Mistral (open, không cần request access)
+    lang_model_name = "mistralai/Mistral-7B-Instruct-v0.2"
+    
+    # OPTION 3: OPT (nhỏ, test nhanh)
+    # lang_model_name = "facebook/opt-1.3b"
+    
+    # OPTION 4: LLaMA 2 (cần request access)
+    # lang_model_name = "meta-llama/Llama-2-7b-chat-hf"
+    
+    lang_model = AutoModelForCausalLM.from_pretrained(
+        lang_model_name,
+        torch_dtype=torch.float16,
+        device_map="auto"
+    )
+    tokenizer = AutoTokenizer.from_pretrained(lang_model_name)
+    
+    # Setup tokenizer
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # Add image token
+    tokenizer.add_tokens(["<image>"], special_tokens=True)
+    image_token_id = tokenizer.convert_tokens_to_ids("<image>")
+    
+    # Resize embeddings
+    lang_model.resize_token_embeddings(len(tokenizer))
+    
+    print(f"  ✓ Vocab size: {len(tokenizer)}")
+    print(f"  ✓ Image token ID: {image_token_id}")
+    print(f"  ✓ Vision hidden: {vision_encoder.config.hidden_size}")
+    print(f"  ✓ Language hidden: {lang_model.config.hidden_size}")
+    
+    # ---------------------------
+    # 3. Build LLaVA Model
+    # ---------------------------
+    print("\n[3/5] Building LLaVA model...")
+    
+    model = LLaVAModel(vision_encoder, lang_model, image_token_id)
+    
+    # Freeze vision encoder
+    for param in model.vision_encoder.parameters():
+        param.requires_grad = False
+    
+    # Apply LoRA to language model
+    print("  Applying LoRA...")
+    lora_config = LoraConfig(
+        r=8,
+        lora_alpha=16,
+        lora_dropout=0.05,
+        target_modules=["q_proj", "v_proj"],  # For LLaMA/Mistral
+        task_type="CAUSAL_LM",
+    )
+    model.lang_model = get_peft_model(model.lang_model, lora_config)
+    
+    # Print trainable parameters
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"  ✓ Trainable: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+    
+    # ---------------------------
+    # 4. Setup Training
+    # ---------------------------
+    print("\n[4/5] Setting up training...")
+    
+    training_args = TrainingArguments(
+        output_dir="./llava_lora_out",
+        per_device_train_batch_size=4,      # Adjust based on GPU memory
+        per_device_eval_batch_size=4,
+        learning_rate=2e-5,
+        num_train_epochs=3,
+        logging_steps=10,
+        save_strategy="epoch",
+        eval_strategy="epoch",
+        bf16=False,                       # Use bf16 for better stability
+        remove_unused_columns=False,
+        gradient_accumulation_steps=4,       # Effective batch = 4 * 4 = 16
+        warmup_ratio=0.03,
+        lr_scheduler_type="cosine",
+        save_total_limit=2,
+        load_best_model_at_end=True,
+        metric_for_best_model="loss",
+    )
+    
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        tokenizer=tokenizer,
+        data_collator=lambda samples: collator(samples, image_token_id=image_token_id),
+    )
+    
+    # ---------------------------
+    # 5. Train!
+    # ---------------------------
+    print("\n[5/5] Starting training...")
+    print("="*60)
+    
+    trainer.train()
+    
+    # ---------------------------
+    # 6. Save
+    # ---------------------------
+    print("\n" + "="*60)
+    print("Saving model...")
+    
+    trainer.save_model("./llava_lora_final")
+    model.lang_model.save_pretrained("./llava_lora_final/language_model")
+    torch.save(model.mm_projector.state_dict(), "./llava_lora_final/mm_projector.pt")
+    
+    print("✓ Training complete!")
+    print(f"  Model saved to: ./llava_lora_final/")
+    print("="*60)
 
-# gắn LoRA cho LM
-config = LoraConfig(
-    r=8,
-    lora_alpha=16,
-    lora_dropout=0.05,
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "out_proj", "proj", "lm_head"],
-    task_type="CAUSAL_LM",
-)
-model.lang_model = get_peft_model(model.lang_model, config)
 
-# ---------------------------
-# 5. Training
-# ---------------------------
-training_args = TrainingArguments(
-    output_dir="./flamingo_lora_out",
-    per_device_train_batch_size=2,
-    per_device_eval_batch_size=2,
-    learning_rate=1e-4,
-    num_train_epochs=5,
-    logging_steps=20,
-    save_strategy="epoch",
-    fp16=True,
-    remove_unused_columns=False,  # cần để collator không bị cắt field
-)
-
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=val_dataset,
-    tokenizer=tokenizer,
-    data_collator=lambda samples: collator(samples),  # dùng collator.py
-)
-
-print("Start training...")
-trainer.train()
+if __name__ == "__main__":
+    main()
