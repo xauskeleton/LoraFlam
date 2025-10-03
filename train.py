@@ -14,6 +14,7 @@ from Collator import collator
 import os
 
 os.environ["WANDB_MODE"] = "disabled"
+from huggingface_hub import login
 
 # LLAVA MODEL DEFINITION
 class LLaVAModel(nn.Module):
@@ -186,7 +187,7 @@ def main():
     
     # Freeze vision encoder
     for param in model.vision_encoder.parameters():
-        param.requires_grad = False
+        param.requires_grad = True
     
     # Apply LoRA to language model
     print("  Applying LoRA...")
@@ -218,7 +219,7 @@ def main():
         logging_steps=10,
         save_strategy="epoch",
         eval_strategy="epoch",
-        bf16=False,                       # Use bf16 for better stability
+        bf16=True,                       # Use bf16 for better stability
         remove_unused_columns=False,
         gradient_accumulation_steps=4,       # Effective batch = 4 * 4 = 16
         warmup_ratio=0.03,
@@ -250,15 +251,22 @@ def main():
     # ---------------------------
     print("\n" + "="*60)
     print("Saving model...")
-    
-    trainer.save_model("./llava_lora_final")
-    model.lang_model.save_pretrained("./llava_lora_final/language_model")
-    torch.save(model.mm_projector.state_dict(), "./llava_lora_final/mm_projector.pt")
-    
-    print("✓ Training complete!")
-    print(f"  Model saved to: ./llava_lora_final/")
-    print("="*60)
 
+    save_dir = "./llava_weights"
+    os.makedirs(save_dir, exist_ok=True)
+
+    # CHỈ lưu 3 thứ:
+    model.lang_model.save_pretrained(f"{save_dir}/lora")  # 1. LoRA
+    torch.save(model.mm_projector.state_dict(), f"{save_dir}/projector.pt")  # 2. Projector
+    tokenizer.save_pretrained(f"{save_dir}/tokenizer")  # 3. Tokenizer
+
+    # + config để biết load lại từ đâu
+    import json
+    json.dump({
+        "vision_model": "openai/clip-vit-large-patch14",
+        "lang_model": "mistralai/Mistral-7B-Instruct-v0.2",
+        "image_token_id": image_token_id,
+    }, open(f"{save_dir}/config.json", "w"), indent=2)
 
 if __name__ == "__main__":
     main()
